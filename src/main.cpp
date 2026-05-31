@@ -10,6 +10,9 @@
 #include <Arduino.h>
 #include <AudioTools.h>
 #include <BluetoothA2DPSink.h>
+#include <PubSubClient.h>
+#include <WiFi.h>
+#include "arduino_secrets.h"
 
 // ----------------------------------------------------------------------------
 // Bluetooth device name — appears in phone's BT device list
@@ -21,10 +24,11 @@
 // I2S is the digital audio bus: BCK = bit clock, WSEL = left/right channel
 // select (word select / LRCK), DIN = audio data into the DAC.
 // These are software-assigned on ESP32 — any output-capable GPIO works.
+// Prefixed I2S_ to avoid colliding with AudioTools' PIN_I2S_* macros.
 // ----------------------------------------------------------------------------
-#define PIN_I2S_BCK   27   // silkscreen: 27
-#define PIN_I2S_WSEL  26   // silkscreen: A0
-#define PIN_I2S_DIN   25   // silkscreen: A1
+#define I2S_PIN_BCK   27   // silkscreen: 27
+#define I2S_PIN_WSEL  26   // silkscreen: A0
+#define I2S_PIN_DIN   25   // silkscreen: A1
 
 // RST: pull low briefly at startup to hardware-reset the TLV320 before
 // initializing it over I2C. Without this, the chip may boot in an unknown state.
@@ -40,7 +44,7 @@
 // Typical values with this hardware: untouched ~1200, touched ~200.
 // ----------------------------------------------------------------------------
 #define PIN_TOUCH       4   // silkscreen: A5
-#define TOUCH_THRESHOLD 600 // touched < threshold; untouched ~1200, touched ~200
+#define TOUCH_THRESHOLD 400 // touched < threshold; untouched ~1200, touched ~200
 
 // ----------------------------------------------------------------------------
 // NeoPixel strip (WS2812B)
@@ -57,11 +61,33 @@
 #define PIN_PIXELS       14   // silkscreen: 14; change to 0 for onboard NeoPixel
 #define NUM_PIXELS       58   // set to match your strip length
 #define PIXEL_BRIGHTNESS 100  // 0–255; ~40% keeps current draw reasonable
-#define PIXEL_COLOR      Adafruit_NeoPixel::Color(255, 120, 20)  // warm amber
+#define PIXEL_COLOR      Adafruit_NeoPixel::Color(255, 180, 60)  // warm amber
 
 // How often to poll the touch pad. 150ms debounces finger contact without
 // feeling laggy. Polling faster than this causes spurious triggers.
 static const unsigned long TOUCH_POLL_MS = 150;
+
+// ----------------------------------------------------------------------------
+// MQTT / Home Assistant
+// Discovery: HA auto-creates the device from the config payload on first boot.
+// State topic:   published after every on/off change (touch or MQTT command)
+// Command topic: HA writes "ON" or "OFF" here to control the light remotely
+// ----------------------------------------------------------------------------
+#define MQTT_CLIENT_ID      "jessa_bedside"
+#define MQTT_TOPIC_DISCOVER "homeassistant/light/jessa_bedside/config"
+#define MQTT_TOPIC_STATE    "jessa_bedside/light/state"
+#define MQTT_TOPIC_SET      "jessa_bedside/light/set"
+
+#define MQTT_TOPIC_VOL_DISCOVER "homeassistant/number/jessa_bedside_volume/config"
+#define MQTT_TOPIC_VOL_STATE    "jessa_bedside/volume/state"
+#define MQTT_TOPIC_VOL_SET      "jessa_bedside/volume/set"
+
+#define MQTT_TOPIC_BRIGHTNESS_STATE "jessa_bedside/light/brightness/state"
+#define MQTT_TOPIC_BRIGHTNESS_SET   "jessa_bedside/light/brightness/set"
+
+// How often the WiFi watchdog and MQTT reconnect logic run (milliseconds).
+static const unsigned long WIFI_CHECK_MS = 30000;
+static const unsigned long MQTT_CHECK_MS =  5000;
 
 // ----------------------------------------------------------------------------
 // Global objects
@@ -83,8 +109,17 @@ I2SStream              i2s;
 // decoded and routed directly into the I2SStream above.
 BluetoothA2DPSink      a2dp_sink(i2s);
 
-// Current LED state — toggled by touch
-bool g_leds_on = false;
+// MQTT client — wraps a WiFiClient for the PubSubClient transport layer
+WiFiClient   wifiClient;
+PubSubClient mqtt(wifiClient);
+
+// Current LED state — toggled by touch or MQTT command
+bool    g_leds_on       = false;
+// Runtime brightness — initialised from the compile-time constant so the
+// first power-on matches the hardware default.
+uint8_t g_brightness    = PIXEL_BRIGHTNESS;
+// DAC volume overlay in dB — sits on top of AVRCP phone volume passthrough
+float   g_dac_volume_db = 0.0f;
 
 
 // ----------------------------------------------------------------------------
@@ -182,16 +217,64 @@ void setupTLV320() {
 
 
 // ----------------------------------------------------------------------------
-// LED control
-// Pushes the current g_leds_on state to the NeoPixel strip.
+// LED rendering
+// Always sets brightness then re-fills from the source color constant before
+// calling show(). This prevents compounding: setBrightness() scales whatever
+// is in the pixel buffer in-place, so calling it twice without re-filling
+// produces non-linear results.
 // ----------------------------------------------------------------------------
-void updateLEDs() {
+static void renderLEDs() {
+    pixels.setBrightness(g_brightness);
     if (g_leds_on) {
-        pixels.fill(PIXEL_COLOR);  // fill all pixels with the designated color
+        pixels.fill(PIXEL_COLOR);
     } else {
-        pixels.clear();            // all pixels off
+        pixels.clear();
     }
     pixels.show();
+}
+
+// Single entry point for on/off state changes.
+void setLEDs(bool on) {
+    g_leds_on = on;
+    renderLEDs();
+    if (mqtt.connected()) {
+        mqtt.publish(MQTT_TOPIC_STATE, on ? "ON" : "OFF", /*retain=*/true);
+    }
+    log_i("LEDs %s", on ? "on" : "off");
+}
+
+// Single entry point for brightness changes.
+// If the light is off the new brightness is stored but the strip stays dark;
+// it takes effect on the next power-on.
+void setBrightnessLevel(uint8_t brightness) {
+    g_brightness = brightness;
+    renderLEDs();
+    if (mqtt.connected()) {
+        char buf[4];
+        snprintf(buf, sizeof(buf), "%u", brightness);
+        mqtt.publish(MQTT_TOPIC_BRIGHTNESS_STATE, buf, /*retain=*/true);
+    }
+    log_i("Brightness: %u", brightness);
+}
+
+
+// ----------------------------------------------------------------------------
+// DAC volume overlay
+// Applies a dB offset to both DAC channels independently of the AVRCP phone
+// volume passthrough. Clamped to the hardware range before writing.
+// ----------------------------------------------------------------------------
+void setDACVolume(float db) {
+    db = constrain(db, -20.0f, 20.0f);
+    g_dac_volume_db = db;
+    codec.setChannelVolume(false, db);  // left
+    codec.setChannelVolume(true,  db);  // right
+
+    if (mqtt.connected()) {
+        char buf[8];
+        snprintf(buf, sizeof(buf), "%.1f", db);
+        mqtt.publish(MQTT_TOPIC_VOL_STATE, buf, /*retain=*/true);
+    }
+    log_i("DAC volume: %.1f dB", db);
 }
 
 
@@ -215,9 +298,7 @@ void checkTouch() {
 
     // Only act on the transition from not-touched to touched (leading edge)
     if (touched && !lastTouched) {
-        g_leds_on = !g_leds_on;
-        updateLEDs();
-        log_i("Touch: LEDs %s", g_leds_on ? "on" : "off");
+        setLEDs(!g_leds_on);
     }
     lastTouched = touched;
 }
@@ -236,6 +317,144 @@ void onVolumeChanged(int volume) {
 
 
 // ----------------------------------------------------------------------------
+// MQTT message callback
+// Called by PubSubClient when a message arrives on a subscribed topic.
+// Only MQTT_TOPIC_SET is subscribed; the payload is "ON" or "OFF".
+// ----------------------------------------------------------------------------
+void onMqttMessage(char* topic, byte* payload, unsigned int length) {
+    String msg((char*)payload, length);
+
+    if (strcmp(topic, MQTT_TOPIC_SET) == 0) {
+        if (msg == "ON")       setLEDs(true);
+        else if (msg == "OFF") setLEDs(false);
+    } else if (strcmp(topic, MQTT_TOPIC_BRIGHTNESS_SET) == 0) {
+        setBrightnessLevel((uint8_t)constrain(msg.toInt(), 0, 255));
+    } else if (strcmp(topic, MQTT_TOPIC_VOL_SET) == 0) {
+        setDACVolume(msg.toFloat());
+    }
+}
+
+
+// ----------------------------------------------------------------------------
+// MQTT connect + Home Assistant discovery
+// Publishes a discovery payload so HA auto-creates a "light" entity for the
+// NeoPixel strip. Discovery only needs to happen once per broker session —
+// HA caches it. The retain flag ensures it survives broker restarts.
+// ----------------------------------------------------------------------------
+void connectMQTT() {
+    log_i("MQTT connecting to %s …", mqttServer);
+
+    if (!mqtt.connect(MQTT_CLIENT_ID, mqttUser, mqttPass,
+                      MQTT_TOPIC_STATE, /*qos*/0, /*retain*/true, "OFF")) {
+        log_w("MQTT connect failed, rc=%d", mqtt.state());
+        return;
+    }
+
+    log_i("MQTT connected");
+
+    // HA MQTT discovery payload — HA parses this and creates a light entity.
+    // unique_id ties the entity to this device across renames/re-pairs.
+    const char* discovery =
+        "{"
+          "\"name\":\"Jessa Bedside\","
+          "\"unique_id\":\"jessa_bedside_light\","
+          "\"device\":{"
+            "\"identifiers\":[\"jessa_bedside\"],"
+            "\"name\":\"Jessa Bedside\","
+            "\"model\":\"ESP32 Bedside Speaker\","
+            "\"manufacturer\":\"DIY\""
+          "},"
+          "\"state_topic\":\"" MQTT_TOPIC_STATE "\","
+          "\"command_topic\":\"" MQTT_TOPIC_SET "\","
+          "\"brightness_state_topic\":\"" MQTT_TOPIC_BRIGHTNESS_STATE "\","
+          "\"brightness_command_topic\":\"" MQTT_TOPIC_BRIGHTNESS_SET "\","
+          "\"brightness_scale\":255,"
+          "\"payload_on\":\"ON\","
+          "\"payload_off\":\"OFF\","
+          "\"optimistic\":false"
+        "}";
+    mqtt.publish(MQTT_TOPIC_DISCOVER, discovery, /*retain=*/true);
+
+    mqtt.subscribe(MQTT_TOPIC_SET);
+    mqtt.subscribe(MQTT_TOPIC_BRIGHTNESS_SET);
+
+    const char* volDiscovery =
+        "{"
+          "\"name\":\"Jessa Bedside Volume\","
+          "\"unique_id\":\"jessa_bedside_volume\","
+          "\"device\":{\"identifiers\":[\"jessa_bedside\"]},"
+          "\"state_topic\":\"" MQTT_TOPIC_VOL_STATE "\","
+          "\"command_topic\":\"" MQTT_TOPIC_VOL_SET "\","
+          "\"min\":-20,"
+          "\"max\":20,"
+          "\"step\":0.5,"
+          "\"unit_of_measurement\":\"dB\""
+        "}";
+    mqtt.publish(MQTT_TOPIC_VOL_DISCOVER, volDiscovery, /*retain=*/true);
+
+    mqtt.subscribe(MQTT_TOPIC_VOL_SET);
+
+    // Publish current states so HA is immediately in sync after (re)connect
+    mqtt.publish(MQTT_TOPIC_STATE, g_leds_on ? "ON" : "OFF", /*retain=*/true);
+
+    char brightBuf[4];
+    snprintf(brightBuf, sizeof(brightBuf), "%u", g_brightness);
+    mqtt.publish(MQTT_TOPIC_BRIGHTNESS_STATE, brightBuf, /*retain=*/true);
+
+    char volBuf[8];
+    snprintf(volBuf, sizeof(volBuf), "%.1f", g_dac_volume_db);
+    mqtt.publish(MQTT_TOPIC_VOL_STATE, volBuf, /*retain=*/true);
+}
+
+
+// ----------------------------------------------------------------------------
+// WiFi watchdog — called from loop every WIFI_CHECK_MS milliseconds.
+// A startup-only connection attempt is not sufficient; the WiFi subsystem
+// stops responding over time without a periodic reconnect cycle.
+// ----------------------------------------------------------------------------
+void checkWiFi() {
+    static unsigned long lastCheck = 0;
+    unsigned long now = millis();
+    if (now - lastCheck < WIFI_CHECK_MS) return;
+    lastCheck = now;
+
+    if (WiFi.status() == WL_CONNECTED) return;
+
+    log_w("WiFi disconnected — reconnecting …");
+    WiFi.disconnect();
+    WiFi.begin(ssid, pass);
+
+    for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) {
+        delay(500);
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        log_i("WiFi reconnected: %s", WiFi.localIP().toString().c_str());
+        // Force an MQTT reconnect on the next checkMQTT() cycle
+        mqtt.disconnect();
+    } else {
+        log_w("WiFi reconnect failed — will retry in %lus", WIFI_CHECK_MS / 1000);
+    }
+}
+
+
+// ----------------------------------------------------------------------------
+// MQTT watchdog — called from loop every MQTT_CHECK_MS milliseconds.
+// ----------------------------------------------------------------------------
+void checkMQTT() {
+    static unsigned long lastCheck = 0;
+    unsigned long now = millis();
+    if (now - lastCheck < MQTT_CHECK_MS) return;
+    lastCheck = now;
+
+    if (WiFi.status() != WL_CONNECTED) return;  // wait for WiFi first
+    if (mqtt.connected()) return;
+
+    connectMQTT();
+}
+
+
+// ----------------------------------------------------------------------------
 // Setup
 // ----------------------------------------------------------------------------
 void setup() {
@@ -245,8 +464,7 @@ void setup() {
     // Initialize NeoPixels before anything else so the strip starts dark.
     // setBrightness sets a global scale factor applied to all pixel writes.
     pixels.begin();
-    pixels.setBrightness(PIXEL_BRIGHTNESS);
-    updateLEDs();  // ensure strip starts off
+    setLEDs(false);  // ensure strip starts off; renderLEDs() sets brightness
 
     // Initialize the TLV320DAC3100 over I2C. This must happen before starting
     // the I2S stream, otherwise the DAC may latch on to the I2S clock in an
@@ -256,9 +474,9 @@ void setup() {
     // Configure the I2S output stream (AudioTools). TX_MODE = transmit only.
     // These pins must match the physical wiring to the TLV320DAC3100.
     auto cfg      = i2s.defaultConfig(TX_MODE);
-    cfg.pin_bck   = PIN_I2S_BCK;
-    cfg.pin_ws    = PIN_I2S_WSEL;
-    cfg.pin_data  = PIN_I2S_DIN;
+    cfg.pin_bck   = I2S_PIN_BCK;
+    cfg.pin_ws    = I2S_PIN_WSEL;
+    cfg.pin_data  = I2S_PIN_DIN;
     i2s.begin(cfg);
 
     // Register the AVRCP volume callback before starting the sink, so volume
@@ -270,14 +488,42 @@ void setup() {
     // reconnects automatically whenever both devices are powered on.
     a2dp_sink.start(DEVICE_NAME);
     log_i("A2DP sink started: %s", DEVICE_NAME);
+
+    // Connect to WiFi. A 10 s timeout keeps startup fast; the watchdog in
+    // loop() will keep retrying if the first attempt fails or drops later.
+    log_i("WiFi connecting to %s …", ssid);
+    WiFi.begin(ssid, pass);
+    for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) {
+        delay(500);
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+        log_i("WiFi connected: %s", WiFi.localIP().toString().c_str());
+    } else {
+        log_w("WiFi not connected at startup — watchdog will retry");
+    }
+
+    // Configure MQTT broker and register the incoming-message callback.
+    // Buffer must be large enough for the discovery payloads (~450 bytes);
+    // the default 256 causes publish() to silently fail on oversized packets.
+    mqtt.setBufferSize(768);
+    mqtt.setServer(mqttServer, 1883);
+    mqtt.setCallback(onMqttMessage);
+
+    if (WiFi.status() == WL_CONNECTED) {
+        connectMQTT();
+    }
 }
 
 
 // ----------------------------------------------------------------------------
 // Loop
 // The A2DP library runs on its own FreeRTOS tasks — no audio polling needed
-// here. The loop only needs to handle touch input.
+// here. The loop handles touch input, WiFi/MQTT watchdogs, and the MQTT
+// receive pump (mqtt.loop()).
 // ----------------------------------------------------------------------------
 void loop() {
+    checkWiFi();
+    checkMQTT();
+    mqtt.loop();     // pumps incoming MQTT messages to onMqttMessage()
     checkTouch();
 }
