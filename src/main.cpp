@@ -107,7 +107,9 @@ I2SStream              i2s;
 // Bluetooth A2DP sink — presents as a Bluetooth audio receiver (like a speaker
 // or headphones). The phone pairs once and reconnects automatically. Audio is
 // decoded and routed directly into the I2SStream above.
-BluetoothA2DPSink      a2dp_sink(i2s);
+// Heap-allocated in setup() to avoid a static-init crash in AudioTools::Allocator
+// that occurs when this is constructed as a global before the ESP32 heap is ready.
+BluetoothA2DPSink*     a2dp_sink = nullptr;
 
 // MQTT client — wraps a WiFiClient for the PubSubClient transport layer
 WiFiClient   wifiClient;
@@ -311,7 +313,7 @@ void checkTouch() {
 // volume, so the phone's volume slider controls the speaker output level.
 // ----------------------------------------------------------------------------
 void onVolumeChanged(int volume) {
-    a2dp_sink.set_volume(volume);
+    a2dp_sink->set_volume(volume);
     log_i("Volume: %d", volume);
 }
 
@@ -411,6 +413,11 @@ void connectMQTT() {
 // WiFi watchdog — called from loop every WIFI_CHECK_MS milliseconds.
 // A startup-only connection attempt is not sufficient; the WiFi subsystem
 // stops responding over time without a periodic reconnect cycle.
+//
+// Non-blocking by design: WiFi.begin() hands off to the ESP32 radio stack
+// and returns immediately. The next WIFI_CHECK_MS interval will see whether
+// it connected. This keeps checkTouch() running at all times — the light
+// must never be held hostage by networking.
 // ----------------------------------------------------------------------------
 void checkWiFi() {
     static unsigned long lastCheck = 0;
@@ -423,18 +430,7 @@ void checkWiFi() {
     log_w("WiFi disconnected — reconnecting …");
     WiFi.disconnect();
     WiFi.begin(ssid, pass);
-
-    for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) {
-        delay(500);
-    }
-
-    if (WiFi.status() == WL_CONNECTED) {
-        log_i("WiFi reconnected: %s", WiFi.localIP().toString().c_str());
-        // Force an MQTT reconnect on the next checkMQTT() cycle
-        mqtt.disconnect();
-    } else {
-        log_w("WiFi reconnect failed — will retry in %lus", WIFI_CHECK_MS / 1000);
-    }
+    // checkMQTT() will detect the new connection and (re)connect the broker.
 }
 
 
@@ -461,6 +457,10 @@ void setup() {
     Serial.begin(115200);
     delay(2000);  // give USB CDC time to enumerate before any serial output
 
+    // Construct the A2DP sink here rather than as a global — AudioTools'
+    // Allocator crashes if constructed before the ESP32 heap is ready.
+    a2dp_sink = new BluetoothA2DPSink(i2s);
+
     // Initialize NeoPixels before anything else so the strip starts dark.
     // setBrightness sets a global scale factor applied to all pixel writes.
     pixels.begin();
@@ -481,37 +481,27 @@ void setup() {
 
     // Register the AVRCP volume callback before starting the sink, so volume
     // events from the phone are handled immediately on connection.
-    a2dp_sink.set_avrc_rn_volumechange(onVolumeChanged);
+    a2dp_sink->set_avrc_rn_volumechange(onVolumeChanged);
 
     // Start the Bluetooth A2DP sink. The device will appear as DEVICE_NAME
     // in the phone's Bluetooth device list. After first pairing, the phone
     // reconnects automatically whenever both devices are powered on.
-    a2dp_sink.start(DEVICE_NAME);
+    a2dp_sink->start(DEVICE_NAME);
     log_i("A2DP sink started: %s", DEVICE_NAME);
 
-    // Connect to WiFi. A 10 s timeout keeps startup fast; the watchdog in
-    // loop() will keep retrying if the first attempt fails or drops later.
+    // Kick off WiFi association and return immediately — the watchdog in loop()
+    // handles both the initial connection and any later drops. The light must
+    // be fully interactive before WiFi is up.
     log_i("WiFi connecting to %s …", ssid);
     WiFi.begin(ssid, pass);
-    for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) {
-        delay(500);
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-        log_i("WiFi connected: %s", WiFi.localIP().toString().c_str());
-    } else {
-        log_w("WiFi not connected at startup — watchdog will retry");
-    }
 
     // Configure MQTT broker and register the incoming-message callback.
     // Buffer must be large enough for the discovery payloads (~450 bytes);
     // the default 256 causes publish() to silently fail on oversized packets.
     mqtt.setBufferSize(768);
+    mqtt.setSocketTimeout(1);  // 1 s max block per connect attempt — local broker is fast
     mqtt.setServer(mqttServer, 1883);
     mqtt.setCallback(onMqttMessage);
-
-    if (WiFi.status() == WL_CONNECTED) {
-        connectMQTT();
-    }
 }
 
 
